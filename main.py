@@ -35,6 +35,7 @@ async def websocket_endpoint(websocket: WebSocket, room: str, role: str, name: s
                     r["pts"], r["pen"] = int(data.get("pts", 10)), int(data.get("pen", 0))
                 if data["type"] == "REVEAL_MASTER": r["status"] = "revealed_master"
                 if data["type"] == "REVEAL_PLAYER": r["status"] = "revealed_player"
+                if data["type"] == "BREAK": r["status"] = "break"
                 if data["type"] == "NEXT": r["q_idx"] += 1; r["status"] = "idle"
                 if data["type"] == "END": r["status"] = "ended"
             if role == "player":
@@ -46,8 +47,13 @@ async def websocket_endpoint(websocket: WebSocket, room: str, role: str, name: s
                     if q["type"].startswith("jackpot"):
                         leader = max(r["teams"].items(), key=lambda x: x[1]["score"])[0]
                         if name != leader: continue
+                    
                     ans = data["ans"].strip().upper()
-                    is_c = ans == q["correct"].strip().upper()
+                    correct_ans = q["correct"].strip().upper()
+                    
+                    # SMART SCORING: Counts "G" for "GREEN" or "1" for "12"
+                    is_c = (ans == correct_ans) or (len(ans) == 1 and correct_ans.startswith(ans))
+                    
                     val = r["pts"] * 3 if (data.get("risking") and team["can_risk"]) else r["pts"]
                     if not is_c and data.get("risking"): team["can_risk"] = False
                     if is_c:
@@ -59,7 +65,7 @@ async def websocket_endpoint(websocket: WebSocket, room: str, role: str, name: s
                         team["streak"] += 1
                         team["max_streak"] = max(team["streak"], team["max_streak"])
                     else: team["score"] -= r["pen"]; team["streak"] = 0
-                    team["hist"].append({"ans": ans, "is_c": is_c})
+                    team["hist"].append({"ans": ans, "is_c": is_c, "q": r["q_idx"]})
             await sync(room)
     except WebSocketDisconnect: pass
 
