@@ -2,7 +2,6 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, stat
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import json
-import asyncio
 from typing import Dict, Any
 
 app = FastAPI()
@@ -10,7 +9,7 @@ app = FastAPI()
 # --- SECURITY & CORS ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Change to your Vercel domains in production
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -24,19 +23,6 @@ class LoginRequest(BaseModel):
     username: str
     password: str
 
-# Structure: {
-#   "room_code": {
-#       "master": WebSocket,
-#       "players": {"team_name": WebSocket},
-#       "state": {
-#           "status": "waiting|active|break",
-#           "current_question": {},
-#           "scores": {"team_name": 0},
-#           "buzzer_selections": {"team_name": {"color": "", "sound": ""}},
-#           "answered_current": [] # Tracks who answered and order for fastest finger
-#       }
-#   }
-# }
 active_rooms: Dict[str, Dict[str, Any]] = {}
 
 # --- CONNECTION MANAGER ---
@@ -47,7 +33,6 @@ class ConnectionManager:
             if len(active_rooms) >= MAX_ROOMS:
                 await websocket.close(code=1008, reason="Server at capacity (Max 3 rooms).")
                 return False
-            # Initialize new room state
             active_rooms[room_code] = {
                 "master": websocket,
                 "players": {},
@@ -60,7 +45,6 @@ class ConnectionManager:
                 }
             }
         else:
-            # Master reconnected, update socket and send current state
             active_rooms[room_code]["master"] = websocket
             await self.send_to_master(room_code, {"type": "state_recovery", "state": active_rooms[room_code]["state"]})
         return True
@@ -71,27 +55,22 @@ class ConnectionManager:
             await websocket.close(code=1008, reason="Invalid room code.")
             return False
         
-        # Add or update player connection
         active_rooms[room_code]["players"][team_name] = websocket
         
-        # Ensure team exists in state
         if team_name not in active_rooms[room_code]["state"]["scores"]:
             active_rooms[room_code]["state"]["scores"][team_name] = 0
             
-        # Send current state to the reconnecting/new player
         await websocket.send_json({
             "type": "game_state", 
             "state": active_rooms[room_code]["state"]
         })
         
-        # Notify master
         await self.send_to_master(room_code, {"type": "player_joined", "team_name": team_name})
         return True
 
     def disconnect_player(self, room_code: str, team_name: str):
         if room_code in active_rooms and team_name in active_rooms[room_code]["players"]:
             del active_rooms[room_code]["players"][team_name]
-            # Note: We do NOT delete them from active_rooms[room_code]["state"] so they keep their score if they rejoin
 
     async def send_to_master(self, room_code: str, message: dict):
         room = active_rooms.get(room_code)
@@ -99,7 +78,7 @@ class ConnectionManager:
             try:
                 await room["master"].send_json(message)
             except WebSocketDisconnect:
-                room["master"] = None # Master dropped, wait for reconnect
+                room["master"] = None 
 
     async def broadcast_to_players(self, room_code: str, message: dict):
         room = active_rooms.get(room_code)
@@ -147,15 +126,31 @@ async def websocket_master(websocket: WebSocket, room_code: str):
                 await websocket.send_json({"type": "heartbeat_ack"})
                 
             elif action == "send_question":
-                # Clear previous answers list
                 active_rooms[room_code]["state"]["answered_current"] = []
                 active_rooms[room_code]["state"]["current_question"] = payload.get("question_data")
-                await manager.broadcast_to_players(room_code, {"type": "new_question", "data": payload.get("question_data")})
+                # Include timer and fastpass flag in the broadcast
+                await manager.broadcast_to_players(room_code, {
+                    "type": "new_question", 
+                    "data": payload.get("question_data"),
+                    "timer": payload.get("timer"),
+                    "allow_fastpass": payload.get("allow_fastpass")
+                })
                 
             elif action == "update_scores":
                 active_rooms[room_code]["state"]["scores"] = payload.get("scores")
                 await manager.broadcast_to_players(room_code, {"type": "score_update", "scores": payload.get("scores")})
                 
+            elif action == "end_question":
+                # Instantly locks out player screens
+                await manager.broadcast_to_players(room_code, {"type": "end_question"})
+                
+            elif action == "reveal_answer":
+                # Tells phones to highlight the correct answers
+                await manager.broadcast_to_players(room_code, {
+                    "type": "reveal_answer", 
+                    "correct": payload.get("correct")
+                })
+
             elif action == "trigger_break":
                 active_rooms[room_code]["state"]["status"] = "break"
                 await manager.broadcast_to_players(room_code, {"type": "break_started", "leaderboard": payload.get("leaderboard")})
@@ -167,12 +162,8 @@ async def websocket_master(websocket: WebSocket, room_code: str):
             elif action == "declare_winner":
                 await manager.broadcast_to_players(room_code, {"type": "quiz_ended", "winner": payload.get("winner")})
                 
-            elif action == "jackpot_offer":
-                await manager.broadcast_to_players(room_code, {"type": "jackpot_trigger", "target_team": payload.get("team_name")})
-
     except WebSocketDisconnect:
         print(f"Master disconnected from room {room_code}")
-        # Room state stays alive so master can refresh and rejoin
 
 @app.websocket("/ws/player/{room_code}/{team_name}")
 async def websocket_player(websocket: WebSocket, room_code: str, team_name: str):
@@ -190,7 +181,6 @@ async def websocket_player(websocket: WebSocket, room_code: str, team_name: str)
                 await websocket.send_json({"type": "heartbeat_ack"})
                 
             elif action == "select_buzzer":
-                # Save their color and sound choice
                 active_rooms[room_code]["state"]["buzzer_selections"][team_name] = {
                     "color": payload.get("color"),
                     "sound": payload.get("sound")
@@ -202,7 +192,6 @@ async def websocket_player(websocket: WebSocket, room_code: str, team_name: str)
                 })
                 
             elif action == "submit_answer":
-                # Fastest finger logic: order is determined by arrival at backend
                 answered_list = active_rooms[room_code]["state"]["answered_current"]
                 is_first = len(answered_list) == 0
                 
